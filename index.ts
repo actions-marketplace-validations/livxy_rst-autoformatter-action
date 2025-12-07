@@ -1,79 +1,138 @@
 import * as core from "@actions/core";
-import { ExecOptions } from "@actions/exec";
-import { exec as cpExec } from "child_process";
+import { exec, ExecOptions } from "@actions/exec";
+import glob from "glob";
 
-interface ExecuteReturn {
-	err: boolean;
-	stdOut: string;
-	stdErr: string;
-}
-
-const execute = async (
-	command: string,
-	options: ExecOptions & { listeners?: any; shell?: string } = {}
-): Promise<ExecuteReturn> => {
-	let stdOut = "";
-	let stdErr = "";
-
-	const execOptions: ExecOptions & { listeners?: any; shell?: string } = {
-		...options,
-		listeners: {
-			stdout: (data: Buffer) => {
-				stdOut += data.toString();
-			},
-			stderr: (data: Buffer) => {
-				stdErr += data.toString();
-			},
-			...options.listeners,
-		},
-		shell: options.shell || "/bin/bash",
-	};
-
-	return new Promise((resolve, reject) => {
-		cpExec(command, { shell: execOptions.shell }, (error, stdout, stderr) => {
+/**
+ * Find files using a glob pattern.
+ * @param filePattern The glob pattern to search for files.
+ * @returns A promise that resolves with an array of file paths matching the pattern.
+ */
+const findFilesWithGlob = (filePattern: string): Promise<string[]> => {
+	return new Promise<string[]>((resolve, reject) => {
+		glob(filePattern, (error: Error | null, files: string[]) => {
 			if (error) {
-				console.error(`exec error: ${error}`);
-				resolve({ err: true, stdOut: stdout, stdErr: stderr });
+				reject(error);
+			} else {
+				resolve(files);
 			}
-			resolve({ err: false, stdOut: stdout, stdErr: stderr });
 		});
 	});
 };
 
-const shellCommands = `
-sudo apt-get update
-sudo apt-get install -y python3.10
-python -m pip install --upgrade pip
-pip install -r requirements.txt
+/**
+ * Execute a command asynchronously.
+ * @param command The command to execute.
+ * @param options Optional configuration options for the execution.
+ * @returns A promise that resolves with the execution result.
+ */
+const execute = async (
+	command: string,
+	{ silent = false }: { silent?: boolean } = {}
+): Promise<{ err: boolean; stdOut: string; stdErr: string }> => {
+	let stdOut: string = "";
+	let stdErr: string = "";
+	const options: ExecOptions = {
+		silent,
+		ignoreReturnCode: true,
+		listeners: {
+			stdout: (data: Buffer) => (stdOut += data.toString()),
+			stderr: (data: Buffer) => (stdErr += data.toString()),
+		},
+	};
 
-# Get a list of all .rst files
-files=$(find . -name "*.rst")
-for file in $files; do
-  rstfmt "$file"
-  cp "$file" temp-$file
-  cmp -s $file temp-$file
-  mv temp-$file $file
-  rm -f temp-$file
-done
+	const exitCode: number = await exec(command, undefined, options);
 
-git config user.name "GitHub Actions"
-git config user.email "<>"
-if [[ -n $(git status -s) ]]; then
-  git add .
-  git commit -m "Apply rstfmt formatting"
-  git push
-else
-  echo "No changes to commit. Skipping commit and push."
-fi
-`;
-
-const run = async () => {
-    const result = await execute(shellCommands);
-    if(result.err) {
-        console.error(result.stdErr);
-    } else {
-        console.log(result.stdOut);
-    }
+	return { err: exitCode !== 0, stdErr, stdOut };
 };
 
-run().catch((error: Error) => core.setFailed(error.message));
+/**
+ * Execute a `git push`.
+ */
+const push = async (): Promise<void> => {await execute("git push")};
+
+/**
+ * Main function that formats RST files based on the provided configuration.
+ */
+const main = async (): Promise<void> => {
+	const DEBUG: boolean = core.isDebug();
+	const args: string = core.getInput("rstfmt-args") || "";
+	const filePatterns: string[] = core.getMultilineInput("files") || ["**/*.rst"];
+
+	const commitString: string = core.getInput("commit") || "true";
+	const commit: boolean = commitString.toLowerCase() !== "false";
+
+	const githubUsername: string = core.getInput("github-username") || "github-actions";
+
+	const commitMessage: string = core.getInput("commit-message") || "Format RST files";
+
+	await core.group("Installing rstfmt", async (): Promise<void> => {
+		await execute("pip install rstfmt", { silent: true });
+	});
+
+	let rstFiles: string[] = [];
+	for (const filePattern of filePatterns) {
+		const files: string[] = await findFilesWithGlob(filePattern);
+		rstFiles = rstFiles.concat(files);
+	}
+
+	if (rstFiles.length === 0) {
+		core.info("No RST files found.");
+		return;
+	}
+
+	const individualFiles: string[] = rstFiles.join("\n").split("\n");
+
+	const formatCommands: string[] = individualFiles.map((file) => `rstfmt ${file}`);
+	core.debug(`Current working directory: ${process.cwd()}`);
+	core.debug(`Formatting RST files: ${individualFiles.join(", ")}`);
+	core.debug(`Format command: ${formatCommands.join(", ")}`);
+	const formatResult: { err: boolean; stdOut: string; stdErr: string }[] = await Promise.all(
+		formatCommands.map((command) => execute(command))
+	);
+
+	const failedFiles: string[] = formatResult
+		.filter((result) => result.err)
+		.map((result, index) => {
+			const cmdIndex: number = formatResult.findIndex((r) => r === result);
+			const failedFile: string = individualFiles[cmdIndex];
+			core.error(`Error formatting RST file: ${failedFile}`);
+			core.error(`Error message: ${result.stdErr}`);
+			return failedFile;
+		});
+
+	if (failedFiles.length > 0) {
+		core.error(`Error formatting RST files: ${failedFiles.join(", ")}`);
+		core.setFailed("Error formatting RST files.");
+		return;
+	}
+
+	core.info("RST files formatted successfully.");
+
+	if (commit) {
+		await core.group("Committing changes", async (): Promise<void> => {
+			await execute(`git config user.name "${githubUsername}"`, {
+				silent: true,
+			});
+			await execute('git config user.email ""', { silent: true });
+			const { err: diffErr }: { err: boolean } = await execute("git diff-index --quiet HEAD", {
+				silent: true,
+			});
+			if (!diffErr) {
+				core.info("Nothing to commit!");
+			} else {
+				await execute(`git commit --all -m "${commitMessage}"`);
+				await push();
+			}
+		});
+	}
+};
+
+try {
+	main();
+} catch (err: unknown) {
+	if (err instanceof Error) {
+		core.setFailed(err.message);
+	} else {
+		core.setFailed("An error occurred.");
+	}
+}

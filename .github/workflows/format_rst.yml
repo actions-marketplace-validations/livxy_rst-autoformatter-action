@@ -1,18 +1,29 @@
-name: Test RST Autoformatter
+name: RST Autoformatter
 
 on: [push, pull_request]
 
 jobs:
-  test:
+  formatting:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v3
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
 
       - name: Run RST Autoformatter
-        uses: livxy/rst-autoformatter-action@main
+        uses: CodeByAidan/rst-autoformatter-action@main
         with:
+          # files: '**/*.rst' # works! - globbing is supported
+          # files: 'tests/*.rst' # works! - just another glob patterns
+          # files: 'tests/lines.rst' # works! - single file
+          # files: '{tests/admonitions,tests/escaped-text}.rst' # works! - brace expansion is supported (Unix trick)
+          # For more patterns, see https://mywiki.wooledge.org/glob#Globs
+          files: '**/*.rst'
           commit: 'true'
           github-username: 'github-actions'
           commit-message: 'Automated RST formatting'
-          files: '**/*.rst'
+
